@@ -384,8 +384,58 @@ static int db_init(void) {
         "CREATE INDEX IF NOT EXISTS idx_movements_created_at ON "
         "stock_movements(created_at);"
 
+        "CREATE TABLE IF NOT EXISTS devices ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  code TEXT NOT NULL UNIQUE,"
+        "  name TEXT NOT NULL,"
+        "  device_type TEXT NOT NULL CHECK(device_type IN ('COLD','NORMAL','HOT')),"
+        "  min_temp_c REAL NOT NULL,"
+        "  max_temp_c REAL NOT NULL,"
+        "  current_temp_c REAL,"
+        "  is_suspended INTEGER NOT NULL DEFAULT 0 CHECK(is_suspended IN (0,1)),"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS device_products ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  device_id INTEGER NOT NULL,"
+        "  product_id INTEGER NOT NULL,"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE CASCADE,"
+        "  FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,"
+        "  UNIQUE(device_id, product_id)"
+        ");"
+
+        "CREATE TABLE IF NOT EXISTS temperature_alerts ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  device_id INTEGER NOT NULL,"
+        "  alert_type TEXT NOT NULL CHECK(alert_type IN ('OVERHEAT','UNDERHEAT')),"
+        "  start_time TEXT NOT NULL,"
+        "  end_time TEXT,"
+        "  affected_products TEXT,"
+        "  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),"
+        "  start_temp_c REAL NOT NULL,"
+        "  end_temp_c REAL,"
+        "  note TEXT,"
+        "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  FOREIGN KEY(device_id) REFERENCES devices(id)"
+        ");"
+
+        "CREATE INDEX IF NOT EXISTS idx_devices_code ON devices(code);"
+        "CREATE INDEX IF NOT EXISTS idx_devices_type ON devices(device_type);"
+        "CREATE INDEX IF NOT EXISTS idx_device_products_device ON device_products(device_id);"
+        "CREATE INDEX IF NOT EXISTS idx_device_products_product ON device_products(product_id);"
+        "CREATE INDEX IF NOT EXISTS idx_alerts_device ON temperature_alerts(device_id);"
+        "CREATE INDEX IF NOT EXISTS idx_alerts_active ON temperature_alerts(is_active);"
+
         "INSERT OR IGNORE INTO products (sku, name, unit, stock_quantity) VALUES "
-        "('SEED-WATER-550', '系统示例矿泉水550ml', '瓶', 50);";
+        "('SEED-WATER-550', '系统示例矿泉水550ml', '瓶', 50);"
+
+        "INSERT OR IGNORE INTO devices (code, name, device_type, min_temp_c, max_temp_c, current_temp_c) VALUES "
+        "('DEV-COLD-001', '冷藏柜1号', 'COLD', 2.0, 8.0, 5.0),"
+        "('DEV-NORMAL-001', '常温柜1号', 'NORMAL', 10.0, 30.0, 22.0),"
+        "('DEV-HOT-001', '加热柜1号', 'HOT', 55.0, 65.0, 60.0);";
 
     if (db_exec(schema_sql) != 0) {
         return -1;
@@ -417,7 +467,8 @@ static int append_body(ConnectionInfo *ci, const char *data, size_t size) {
 static int is_method_with_body(const char *method) {
     return strcmp(method, MHD_HTTP_METHOD_POST) == 0 ||
            strcmp(method, MHD_HTTP_METHOD_PUT) == 0 ||
-           strcmp(method, MHD_HTTP_METHOD_PATCH) == 0;
+           strcmp(method, MHD_HTTP_METHOD_PATCH) == 0 ||
+           strcmp(method, MHD_HTTP_METHOD_DELETE) == 0;
 }
 
 static int parse_json_body(ConnectionInfo *ci, json_t **out,
@@ -704,6 +755,22 @@ static int parse_int_field(json_t *obj, const char *key, int min, int max,
     }
 
     *out = (int)n;
+    return 0;
+}
+
+static int parse_real_field(json_t *obj, const char *key, double min, double max,
+                            double *out) {
+    json_t *v = json_object_get(obj, key);
+    if (!json_is_number(v)) {
+        return -1;
+    }
+
+    double n = json_real_value(v);
+    if (n < min || n > max) {
+        return -1;
+    }
+
+    *out = n;
     return 0;
 }
 
@@ -1657,6 +1724,868 @@ static int parse_limit_query(struct MHD_Connection *connection) {
     return (int)v;
 }
 
+static void format_current_time(char *buf, size_t buf_size) {
+    time_t t = now_epoch();
+    struct tm *tm_info = localtime(&t);
+    strftime(buf, buf_size, "%Y-%m-%d %H:%M:%S", tm_info);
+}
+
+static char *get_device_affected_products(int device_id) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT p.sku || ':' || p.name "
+        "FROM device_products dp "
+        "JOIN products p ON p.id = dp.product_id "
+        "WHERE dp.device_id = ? "
+        "ORDER BY p.id;";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+
+    sqlite3_bind_int(stmt, 1, device_id);
+
+    json_t *products = json_array();
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        json_array_append_new(products, json_string(safe_col_text(stmt, 0)));
+    }
+    sqlite3_finalize(stmt);
+
+    char *result = json_dumps(products, JSON_COMPACT);
+    json_decref(products);
+    return result;
+}
+
+static int check_temperature_alert(int device_id, double current_temp,
+                                   double min_temp, double max_temp) {
+    sqlite3_stmt *stmt = NULL;
+    int has_active_alert = 0;
+    char active_alert_type[16] = {0};
+
+    const char *check_sql =
+        "SELECT alert_type FROM temperature_alerts "
+        "WHERE device_id = ? AND is_active = 1 "
+        "ORDER BY id DESC LIMIT 1;";
+
+    if (sqlite3_prepare_v2(g_db, check_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, device_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            has_active_alert = 1;
+            snprintf(active_alert_type, sizeof(active_alert_type), "%s",
+                     safe_col_text(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    int is_overheat = current_temp > max_temp;
+    int is_underheat = current_temp < min_temp;
+    int is_out_of_range = is_overheat || is_underheat;
+
+    char now_str[32];
+    format_current_time(now_str, sizeof(now_str));
+
+    if (is_out_of_range && !has_active_alert) {
+        char *affected = get_device_affected_products(device_id);
+        const char *alert_type = is_overheat ? "OVERHEAT" : "UNDERHEAT";
+
+        const char *insert_sql =
+            "INSERT INTO temperature_alerts "
+            "(device_id, alert_type, start_time, affected_products, "
+            "is_active, start_temp_c, note) "
+            "VALUES (?, ?, ?, ?, 1, ?, '温度超限自动记录');";
+
+        if (sqlite3_prepare_v2(g_db, insert_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, device_id);
+            sqlite3_bind_text(stmt, 2, alert_type, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, now_str, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 4, affected ? affected : "[]", -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_double(stmt, 5, current_temp);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+
+        const char *update_sql =
+            "UPDATE devices SET is_suspended = 1, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?;";
+        if (sqlite3_prepare_v2(g_db, update_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, device_id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+
+        free(affected);
+        return 1;
+    }
+
+    if (!is_out_of_range && has_active_alert) {
+        const char *update_sql =
+            "UPDATE temperature_alerts "
+            "SET end_time = ?, end_temp_c = ?, is_active = 0 "
+            "WHERE device_id = ? AND is_active = 1;";
+
+        if (sqlite3_prepare_v2(g_db, update_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, now_str, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(stmt, 2, current_temp);
+            sqlite3_bind_int(stmt, 3, device_id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+
+        const char *update_dev_sql =
+            "UPDATE devices SET is_suspended = 0, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?;";
+        if (sqlite3_prepare_v2(g_db, update_dev_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, device_id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+
+        return -1;
+    }
+
+    return 0;
+}
+
+static enum MHD_Result handle_create_device(struct MHD_Connection *connection,
+                                            ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *code = NULL;
+    const char *name = NULL;
+    const char *device_type = NULL;
+    if (require_string_field(body, "code", 32, &code) != 0 ||
+        require_string_field(body, "name", 64, &name) != 0 ||
+        require_string_field(body, "device_type", 16, &device_type) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "code/name/device_type 必填");
+    }
+
+    if (strcmp(device_type, "COLD") != 0 && strcmp(device_type, "NORMAL") != 0 &&
+        strcmp(device_type, "HOT") != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "device_type 仅支持 COLD/NORMAL/HOT");
+    }
+
+    double min_temp = 0.0, max_temp = 0.0;
+    if (parse_real_field(body, "min_temp_c", -50.0, 150.0, &min_temp) != 0 ||
+        parse_real_field(body, "max_temp_c", -50.0, 150.0, &max_temp) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "min_temp_c/max_temp_c 必须为合法温度值");
+    }
+
+    if (min_temp >= max_temp) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "min_temp_c 必须小于 max_temp_c");
+    }
+
+    char code_copy[33];
+    char name_copy[65];
+    char type_copy[17];
+    snprintf(code_copy, sizeof(code_copy), "%s", code);
+    snprintf(name_copy, sizeof(name_copy), "%s", name);
+    snprintf(type_copy, sizeof(type_copy), "%s", device_type);
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可创建设备");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO devices (code, name, device_type, min_temp_c, max_temp_c) "
+        "VALUES (?, ?, ?, ?, ?);";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "创建设备失败");
+    }
+
+    sqlite3_bind_text(stmt, 1, code_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, name_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, type_copy, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 4, min_temp);
+    sqlite3_bind_double(stmt, 5, max_temp);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    if (rc != SQLITE_DONE) {
+        if (rc == SQLITE_CONSTRAINT) {
+            return respond_error(connection, MHD_HTTP_CONFLICT, "CONFLICT",
+                                "设备编号已存在");
+        }
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "创建设备失败");
+    }
+
+    json_t *data = json_object();
+    json_object_set_new(data, "code", json_string(code_copy));
+    json_object_set_new(data, "name", json_string(name_copy));
+    json_object_set_new(data, "device_type", json_string(type_copy));
+    json_object_set_new(data, "min_temp_c", json_real(min_temp));
+    json_object_set_new(data, "max_temp_c", json_real(max_temp));
+    return respond_success(connection, MHD_HTTP_CREATED, data);
+}
+
+static enum MHD_Result handle_list_devices(struct MHD_Connection *connection) {
+    pthread_mutex_lock(&g_db_mutex);
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT id, code, name, device_type, min_temp_c, max_temp_c, "
+        "current_temp_c, is_suspended, created_at, updated_at "
+        "FROM devices ORDER BY id ASC;";
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询设备列表失败");
+    }
+
+    json_t *items = json_array();
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        json_t *item = json_object();
+        json_object_set_new(item, "id", json_integer(sqlite3_column_int(stmt, 0)));
+        json_object_set_new(item, "code", json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(item, "name", json_string(safe_col_text(stmt, 2)));
+        json_object_set_new(item, "device_type", json_string(safe_col_text(stmt, 3)));
+        json_object_set_new(item, "min_temp_c", json_real(sqlite3_column_double(stmt, 4)));
+        json_object_set_new(item, "max_temp_c", json_real(sqlite3_column_double(stmt, 5)));
+        if (sqlite3_column_type(stmt, 6) == SQLITE_NULL) {
+            json_object_set_new(item, "current_temp_c", json_null());
+        } else {
+            json_object_set_new(item, "current_temp_c", json_real(sqlite3_column_double(stmt, 6)));
+        }
+        json_object_set_new(item, "is_suspended",
+                            json_integer(sqlite3_column_int(stmt, 7)));
+        json_object_set_new(item, "created_at", json_string(safe_col_text(stmt, 8)));
+        json_object_set_new(item, "updated_at", json_string(safe_col_text(stmt, 9)));
+        json_array_append_new(items, item);
+    }
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取设备列表失败");
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, items);
+}
+
+static enum MHD_Result handle_report_temperature(struct MHD_Connection *connection,
+                                                 ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *code = NULL;
+    if (require_string_field(body, "code", 32, &code) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "设备编号 code 必填");
+    }
+
+    double temperature = 0.0;
+    if (parse_real_field(body, "temperature_c", -50.0, 150.0, &temperature) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "temperature_c 必须为合法温度值");
+    }
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int device_id = 0;
+    double min_temp = 0.0, max_temp = 0.0;
+    int was_suspended = 0;
+
+    const char *find_sql =
+        "SELECT id, min_temp_c, max_temp_c, is_suspended FROM devices "
+        "WHERE code = ? LIMIT 1;";
+
+    if (sqlite3_prepare_v2(g_db, find_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询设备失败");
+    }
+
+    sqlite3_bind_text(stmt, 1, code, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "设备不存在");
+    }
+
+    device_id = sqlite3_column_int(stmt, 0);
+    min_temp = sqlite3_column_double(stmt, 1);
+    max_temp = sqlite3_column_double(stmt, 2);
+    was_suspended = sqlite3_column_int(stmt, 3);
+    sqlite3_finalize(stmt);
+
+    const char *update_sql =
+        "UPDATE devices SET current_temp_c = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?;";
+    if (sqlite3_prepare_v2(g_db, update_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新温度失败");
+    }
+
+    sqlite3_bind_double(stmt, 1, temperature);
+    sqlite3_bind_int(stmt, 2, device_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "更新温度失败");
+    }
+
+    int alert_status = check_temperature_alert(device_id, temperature, min_temp, max_temp);
+
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    int is_out_of_range = (temperature > max_temp) || (temperature < min_temp);
+    int is_now_suspended = is_out_of_range || (alert_status == 0 && was_suspended == 1);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "device_code", json_string(code));
+    json_object_set_new(data, "temperature_c", json_real(temperature));
+    json_object_set_new(data, "min_temp_c", json_real(min_temp));
+    json_object_set_new(data, "max_temp_c", json_real(max_temp));
+    json_object_set_new(data, "is_out_of_range", is_out_of_range ? json_true() : json_false());
+    json_object_set_new(data, "is_suspended", is_now_suspended ? json_true() : json_false());
+
+    if (alert_status == 1) {
+        json_object_set_new(data, "alert_triggered", json_true());
+        json_object_set_new(data, "alert_type",
+                            json_string(temperature > max_temp ? "OVERHEAT" : "UNDERHEAT"));
+    } else if (alert_status == -1) {
+        json_object_set_new(data, "alert_resolved", json_true());
+    } else {
+        json_object_set_new(data, "alert_triggered", json_false());
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_add_device_product(struct MHD_Connection *connection,
+                                                 ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *device_code = NULL;
+    const char *sku = NULL;
+    if (require_string_field(body, "device_code", 32, &device_code) != 0 ||
+        require_string_field(body, "sku", 64, &sku) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "device_code/sku 必填");
+    }
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可配置设备商品");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int device_id = 0;
+    int product_id = 0;
+
+    const char *find_dev_sql = "SELECT id FROM devices WHERE code = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_dev_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询设备失败");
+    }
+    sqlite3_bind_text(stmt, 1, device_code, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "设备不存在");
+    }
+    device_id = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    const char *find_prod_sql = "SELECT id FROM products WHERE sku = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_prod_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询商品失败");
+    }
+    sqlite3_bind_text(stmt, 1, sku, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "商品不存在");
+    }
+    product_id = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    const char *insert_sql =
+        "INSERT OR IGNORE INTO device_products (device_id, product_id) "
+        "VALUES (?, ?);";
+    if (sqlite3_prepare_v2(g_db, insert_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "添加关联失败");
+    }
+    sqlite3_bind_int(stmt, 1, device_id);
+    sqlite3_bind_int(stmt, 2, product_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    if (rc != SQLITE_DONE) {
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "添加关联失败");
+    }
+
+    json_t *data = json_object();
+    json_object_set_new(data, "device_code", json_string(device_code));
+    json_object_set_new(data, "sku", json_string(sku));
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_remove_device_product(struct MHD_Connection *connection,
+                                                    ConnectionInfo *ci) {
+    char err[256];
+    json_t *body = NULL;
+    if (parse_json_body(ci, &body, err) != 0) {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_JSON", err);
+    }
+
+    const char *device_code = NULL;
+    const char *sku = NULL;
+    if (require_string_field(body, "device_code", 32, &device_code) != 0 ||
+        require_string_field(body, "sku", 64, &sku) != 0) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "device_code/sku 必填");
+    }
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    if (!is_admin_role(&user)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_FORBIDDEN, "FORBIDDEN",
+                            "仅管理员可配置设备商品");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int device_id = 0;
+    int product_id = 0;
+
+    const char *find_dev_sql = "SELECT id FROM devices WHERE code = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_dev_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询设备失败");
+    }
+    sqlite3_bind_text(stmt, 1, device_code, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "设备不存在");
+    }
+    device_id = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    const char *find_prod_sql = "SELECT id FROM products WHERE sku = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, find_prod_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询商品失败");
+    }
+    sqlite3_bind_text(stmt, 1, sku, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "商品不存在");
+    }
+    product_id = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    const char *delete_sql =
+        "DELETE FROM device_products WHERE device_id = ? AND product_id = ?;";
+    if (sqlite3_prepare_v2(g_db, delete_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "移除关联失败");
+    }
+    sqlite3_bind_int(stmt, 1, device_id);
+    sqlite3_bind_int(stmt, 2, product_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    pthread_mutex_unlock(&g_db_mutex);
+    json_decref(body);
+
+    if (rc != SQLITE_DONE) {
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "移除关联失败");
+    }
+
+    json_t *data = json_object();
+    json_object_set_new(data, "device_code", json_string(device_code));
+    json_object_set_new(data, "sku", json_string(sku));
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_device_status(struct MHD_Connection *connection) {
+    const char *code =
+        MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "code");
+
+    if (code == NULL || *code == '\0') {
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "设备编号 code 必填");
+    }
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    int device_id = 0;
+    char device_code[33] = {0};
+    char device_name[65] = {0};
+    char device_type[17] = {0};
+    double min_temp = 0.0, max_temp = 0.0, current_temp = 0.0;
+    int is_suspended = 0;
+    int has_current_temp = 0;
+
+    const char *find_sql =
+        "SELECT id, code, name, device_type, min_temp_c, max_temp_c, "
+        "current_temp_c, is_suspended "
+        "FROM devices WHERE code = ? LIMIT 1;";
+
+    if (sqlite3_prepare_v2(g_db, find_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询设备失败");
+    }
+
+    sqlite3_bind_text(stmt, 1, code, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                            "设备不存在");
+    }
+
+    device_id = sqlite3_column_int(stmt, 0);
+    snprintf(device_code, sizeof(device_code), "%s", safe_col_text(stmt, 1));
+    snprintf(device_name, sizeof(device_name), "%s", safe_col_text(stmt, 2));
+    snprintf(device_type, sizeof(device_type), "%s", safe_col_text(stmt, 3));
+    min_temp = sqlite3_column_double(stmt, 4);
+    max_temp = sqlite3_column_double(stmt, 5);
+    if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+        current_temp = sqlite3_column_double(stmt, 6);
+        has_current_temp = 1;
+    }
+    is_suspended = sqlite3_column_int(stmt, 7);
+    sqlite3_finalize(stmt);
+
+    int is_out_of_range = 0;
+    const char *temp_status = "NORMAL";
+    if (has_current_temp) {
+        if (current_temp > max_temp) {
+            is_out_of_range = 1;
+            temp_status = "OVERHEAT";
+        } else if (current_temp < min_temp) {
+            is_out_of_range = 1;
+            temp_status = "UNDERHEAT";
+        }
+    }
+
+    json_t *products = json_array();
+    const char *prod_sql =
+        "SELECT p.id, p.sku, p.name, p.unit, p.stock_quantity "
+        "FROM device_products dp "
+        "JOIN products p ON p.id = dp.product_id "
+        "WHERE dp.device_id = ? "
+        "ORDER BY p.id;";
+
+    if (sqlite3_prepare_v2(g_db, prod_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, device_id);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            json_t *item = json_object();
+            json_object_set_new(item, "id", json_integer(sqlite3_column_int(stmt, 0)));
+            json_object_set_new(item, "sku", json_string(safe_col_text(stmt, 1)));
+            json_object_set_new(item, "name", json_string(safe_col_text(stmt, 2)));
+            json_object_set_new(item, "unit", json_string(safe_col_text(stmt, 3)));
+            json_object_set_new(item, "stock_quantity",
+                                json_integer(sqlite3_column_int(stmt, 4)));
+            json_object_set_new(item, "can_sell",
+                                is_suspended ? json_false() : json_true());
+            if (is_suspended) {
+                json_object_set_new(item, "unsellable_reason",
+                                    json_string("设备温度超限，暂停售卖"));
+            }
+            json_array_append_new(products, item);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    json_t *active_alert = json_null();
+    const char *alert_sql =
+        "SELECT id, alert_type, start_time, start_temp_c, affected_products "
+        "FROM temperature_alerts "
+        "WHERE device_id = ? AND is_active = 1 "
+        "ORDER BY id DESC LIMIT 1;";
+
+    if (sqlite3_prepare_v2(g_db, alert_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, device_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            active_alert = json_object();
+            json_object_set_new(active_alert, "id",
+                                json_integer(sqlite3_column_int(stmt, 0)));
+            json_object_set_new(active_alert, "alert_type",
+                                json_string(safe_col_text(stmt, 1)));
+            json_object_set_new(active_alert, "start_time",
+                                json_string(safe_col_text(stmt, 2)));
+            json_object_set_new(active_alert, "start_temp_c",
+                                json_real(sqlite3_column_double(stmt, 3)));
+            json_error_t jerr;
+            json_t *affected = json_loads(safe_col_text(stmt, 4), 0, &jerr);
+            json_object_set_new(active_alert, "affected_products",
+                                affected ? affected : json_array());
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    pthread_mutex_unlock(&g_db_mutex);
+
+    json_t *data = json_object();
+    json_object_set_new(data, "id", json_integer(device_id));
+    json_object_set_new(data, "code", json_string(device_code));
+    json_object_set_new(data, "name", json_string(device_name));
+    json_object_set_new(data, "device_type", json_string(device_type));
+    json_object_set_new(data, "min_temp_c", json_real(min_temp));
+    json_object_set_new(data, "max_temp_c", json_real(max_temp));
+    if (has_current_temp) {
+        json_object_set_new(data, "current_temp_c", json_real(current_temp));
+    } else {
+        json_object_set_new(data, "current_temp_c", json_null());
+    }
+    json_object_set_new(data, "temperature_status", json_string(temp_status));
+    json_object_set_new(data, "is_out_of_range",
+                        is_out_of_range ? json_true() : json_false());
+    json_object_set_new(data, "is_suspended",
+                        is_suspended ? json_true() : json_false());
+    json_object_set_new(data, "active_alert", active_alert);
+    json_object_set_new(data, "products", products);
+
+    return respond_success(connection, MHD_HTTP_OK, data);
+}
+
+static enum MHD_Result handle_list_alerts(struct MHD_Connection *connection) {
+    const char *device_code =
+        MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "device_code");
+    const char *active_only =
+        MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "active_only");
+    int limit = parse_limit_query(connection);
+
+    pthread_mutex_lock(&g_db_mutex);
+
+    AuthUser user;
+    char token_hash[TOKEN_HASH_HEX_LEN + 1] = {0};
+    if (!authenticate_request(connection, &user, token_hash)) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_UNAUTHORIZED, "UNAUTHORIZED",
+                            "需要登录");
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    char base_sql[1024];
+    int use_device = (device_code != NULL && *device_code != '\0');
+    int use_active = (active_only != NULL && strcmp(active_only, "1") == 0);
+
+    snprintf(base_sql, sizeof(base_sql),
+        "SELECT a.id, d.code, d.name, a.alert_type, a.start_time, "
+        "a.end_time, a.is_active, a.start_temp_c, a.end_temp_c, "
+        "a.affected_products, a.note, a.created_at "
+        "FROM temperature_alerts a "
+        "JOIN devices d ON d.id = a.device_id ");
+
+    char where_clause[256] = "";
+    int cond_count = 0;
+
+    if (use_device) {
+        strcat(where_clause, "WHERE d.code = ? ");
+        cond_count++;
+    }
+    if (use_active) {
+        if (cond_count > 0) {
+            strcat(where_clause, "AND ");
+        } else {
+            strcat(where_clause, "WHERE ");
+        }
+        strcat(where_clause, "a.is_active = 1 ");
+    }
+
+    strcat(base_sql, where_clause);
+    strcat(base_sql, "ORDER BY a.id DESC LIMIT ?;");
+
+    if (sqlite3_prepare_v2(g_db, base_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "查询告警失败");
+    }
+
+    int idx = 1;
+    if (use_device) {
+        sqlite3_bind_text(stmt, idx++, device_code, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int(stmt, idx, limit);
+
+    json_t *items = json_array();
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        json_t *item = json_object();
+        json_object_set_new(item, "id", json_integer(sqlite3_column_int(stmt, 0)));
+        json_object_set_new(item, "device_code", json_string(safe_col_text(stmt, 1)));
+        json_object_set_new(item, "device_name", json_string(safe_col_text(stmt, 2)));
+        json_object_set_new(item, "alert_type", json_string(safe_col_text(stmt, 3)));
+        json_object_set_new(item, "start_time", json_string(safe_col_text(stmt, 4)));
+        if (sqlite3_column_type(stmt, 5) == SQLITE_NULL) {
+            json_object_set_new(item, "end_time", json_null());
+        } else {
+            json_object_set_new(item, "end_time", json_string(safe_col_text(stmt, 5)));
+        }
+        json_object_set_new(item, "is_active",
+                            json_integer(sqlite3_column_int(stmt, 6)));
+        json_object_set_new(item, "start_temp_c",
+                            json_real(sqlite3_column_double(stmt, 7)));
+        if (sqlite3_column_type(stmt, 8) == SQLITE_NULL) {
+            json_object_set_new(item, "end_temp_c", json_null());
+        } else {
+            json_object_set_new(item, "end_temp_c",
+                                json_real(sqlite3_column_double(stmt, 8)));
+        }
+        json_error_t jerr;
+        json_t *affected = json_loads(safe_col_text(stmt, 9), 0, &jerr);
+        json_object_set_new(item, "affected_products",
+                            affected ? affected : json_array());
+        json_object_set_new(item, "note", json_string(safe_col_text(stmt, 10)));
+        json_object_set_new(item, "created_at", json_string(safe_col_text(stmt, 11)));
+        json_array_append_new(items, item);
+    }
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&g_db_mutex);
+
+    if (rc != SQLITE_DONE) {
+        json_decref(items);
+        return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                            "DB_ERROR", "读取告警失败");
+    }
+
+    return respond_success(connection, MHD_HTTP_OK, items);
+}
+
 static enum MHD_Result handle_movements(struct MHD_Connection *connection) {
     pthread_mutex_lock(&g_db_mutex);
 
@@ -1804,6 +2733,44 @@ static enum MHD_Result route_movements(struct MHD_Connection *connection,
     return handle_movements(connection);
 }
 
+static enum MHD_Result route_create_device(struct MHD_Connection *connection,
+                                           ConnectionInfo *ci) {
+    return handle_create_device(connection, ci);
+}
+
+static enum MHD_Result route_list_devices(struct MHD_Connection *connection,
+                                          ConnectionInfo *ci) {
+    (void)ci;
+    return handle_list_devices(connection);
+}
+
+static enum MHD_Result route_report_temperature(struct MHD_Connection *connection,
+                                                ConnectionInfo *ci) {
+    return handle_report_temperature(connection, ci);
+}
+
+static enum MHD_Result route_add_device_product(struct MHD_Connection *connection,
+                                                ConnectionInfo *ci) {
+    return handle_add_device_product(connection, ci);
+}
+
+static enum MHD_Result route_remove_device_product(struct MHD_Connection *connection,
+                                                   ConnectionInfo *ci) {
+    return handle_remove_device_product(connection, ci);
+}
+
+static enum MHD_Result route_device_status(struct MHD_Connection *connection,
+                                           ConnectionInfo *ci) {
+    (void)ci;
+    return handle_device_status(connection);
+}
+
+static enum MHD_Result route_list_alerts(struct MHD_Connection *connection,
+                                         ConnectionInfo *ci) {
+    (void)ci;
+    return handle_list_alerts(connection);
+}
+
 static enum MHD_Result route_openapi_doc(struct MHD_Connection *connection,
                                          ConnectionInfo *ci);
 
@@ -1843,6 +2810,20 @@ static const ApiRoute g_api_routes[] = {
      "库存汇总与明细", "Inventory", 0, 0, 1},
     {MHD_HTTP_METHOD_GET, "/api/v1/movements", route_movements, "Movement History",
      "库存流水查询", "Inventory", 1, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/devices", route_create_device,
+     "Create Device", "创建设备（管理员）", "Temperature", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/devices", route_list_devices,
+     "List Devices", "查询设备列表", "Temperature", 0, 0, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/devices/temperature", route_report_temperature,
+     "Report Temperature", "上报设备温度，自动检测超限", "Temperature", 1, 1, 1},
+    {MHD_HTTP_METHOD_POST, "/api/v1/devices/products", route_add_device_product,
+     "Add Device Product", "给设备添加商品（管理员）", "Temperature", 1, 1, 1},
+    {MHD_HTTP_METHOD_DELETE, "/api/v1/devices/products", route_remove_device_product,
+     "Remove Device Product", "移除设备商品（管理员）", "Temperature", 1, 1, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/devices/status", route_device_status,
+     "Device Status", "设备状态查询，补货员查看不可售卖商品", "Temperature", 1, 0, 1},
+    {MHD_HTTP_METHOD_GET, "/api/v1/temperature/alerts", route_list_alerts,
+     "Temperature Alerts", "温度异常记录查询", "Temperature", 1, 0, 1},
     {MHD_HTTP_METHOD_GET, "/api/v1/openapi.json", route_openapi_doc,
      "OpenAPI Document", "自动生成的 OpenAPI 文档", "System", 0, 0, 1},
     {MHD_HTTP_METHOD_GET, "/docs", route_swagger_ui, "Swagger UI",
@@ -1869,7 +2850,7 @@ static enum MHD_Result handle_options(struct MHD_Connection *connection) {
     MHD_add_response_header(response, "Access-Control-Allow-Headers",
                             "Content-Type, Authorization");
     MHD_add_response_header(response, "Access-Control-Allow-Methods",
-                            "GET, POST, OPTIONS");
+                            "GET, POST, DELETE, OPTIONS");
 
     enum MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_NO_CONTENT, response);
     MHD_destroy_response(response);
