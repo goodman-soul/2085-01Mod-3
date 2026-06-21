@@ -401,7 +401,9 @@ static int db_init(void) {
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  device_id INTEGER NOT NULL,"
         "  product_id INTEGER NOT NULL,"
+        "  cabinet_quantity INTEGER NOT NULL DEFAULT 0 CHECK(cabinet_quantity >= 0),"
         "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "  FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE CASCADE,"
         "  FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,"
         "  UNIQUE(device_id, product_id)"
@@ -1349,8 +1351,20 @@ static enum MHD_Result handle_inbound(struct MHD_Connection *connection,
                             "note 需为字符串且不超过256字符");
     }
 
+    const char *device_code = optional_string_field(body, "device_code", 32);
+    if (device_code == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "device_code 需为字符串且不超过32字符");
+    }
+    int has_device = (device_code != NULL && *device_code != '\0');
+
     char sku_copy[65];
+    char device_code_copy[33];
     snprintf(sku_copy, sizeof(sku_copy), "%s", sku);
+    if (has_device) {
+        snprintf(device_code_copy, sizeof(device_code_copy), "%s", device_code);
+    }
 
     pthread_mutex_lock(&g_db_mutex);
 
@@ -1398,6 +1412,98 @@ static enum MHD_Result handle_inbound(struct MHD_Connection *connection,
     product_id = sqlite3_column_int(stmt, 0);
     current_stock = sqlite3_column_int(stmt, 1);
     sqlite3_finalize(stmt);
+
+    int device_id = 0;
+    int cabinet_quantity = 0;
+    int new_cabinet_quantity = 0;
+
+    if (has_device) {
+        const char *find_dev_sql = "SELECT id FROM devices WHERE code = ? LIMIT 1;";
+        if (sqlite3_prepare_v2(g_db, find_dev_sql, -1, &stmt, NULL) != SQLITE_OK) {
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                "DB_ERROR", "查询设备失败");
+        }
+        sqlite3_bind_text(stmt, 1, device_code_copy, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                                "设备不存在");
+        }
+        device_id = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+
+        const char *find_dp_sql =
+            "SELECT id, cabinet_quantity FROM device_products "
+            "WHERE device_id = ? AND product_id = ? LIMIT 1;";
+        int dp_exists = 0;
+        int dp_id = 0;
+        if (sqlite3_prepare_v2(g_db, find_dp_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, device_id);
+            sqlite3_bind_int(stmt, 2, product_id);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                dp_exists = 1;
+                dp_id = sqlite3_column_int(stmt, 0);
+                cabinet_quantity = sqlite3_column_int(stmt, 1);
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        new_cabinet_quantity = cabinet_quantity + quantity;
+
+        if (dp_exists) {
+            const char *upd_dp_sql =
+                "UPDATE device_products SET cabinet_quantity = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?;";
+            if (sqlite3_prepare_v2(g_db, upd_dp_sql, -1, &stmt, NULL) != SQLITE_OK) {
+                rollback_transaction();
+                pthread_mutex_unlock(&g_db_mutex);
+                json_decref(body);
+                return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    "DB_ERROR", "更新柜机库存失败");
+            }
+            sqlite3_bind_int(stmt, 1, new_cabinet_quantity);
+            sqlite3_bind_int(stmt, 2, dp_id);
+            rc = sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            if (rc != SQLITE_DONE) {
+                rollback_transaction();
+                pthread_mutex_unlock(&g_db_mutex);
+                json_decref(body);
+                return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    "DB_ERROR", "更新柜机库存失败");
+            }
+        } else {
+            const char *ins_dp_sql =
+                "INSERT INTO device_products (device_id, product_id, cabinet_quantity) "
+                "VALUES (?, ?, ?);";
+            if (sqlite3_prepare_v2(g_db, ins_dp_sql, -1, &stmt, NULL) != SQLITE_OK) {
+                rollback_transaction();
+                pthread_mutex_unlock(&g_db_mutex);
+                json_decref(body);
+                return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    "DB_ERROR", "创建柜机商品关联失败");
+            }
+            sqlite3_bind_int(stmt, 1, device_id);
+            sqlite3_bind_int(stmt, 2, product_id);
+            sqlite3_bind_int(stmt, 3, quantity);
+            rc = sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            if (rc != SQLITE_DONE) {
+                rollback_transaction();
+                pthread_mutex_unlock(&g_db_mutex);
+                json_decref(body);
+                return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    "DB_ERROR", "创建柜机商品关联失败");
+            }
+        }
+    }
 
     const int new_stock = current_stock + quantity;
 
@@ -1463,6 +1569,11 @@ static enum MHD_Result handle_inbound(struct MHD_Connection *connection,
     json_object_set_new(data, "quantity", json_integer(quantity));
     json_object_set_new(data, "new_stock", json_integer(new_stock));
     json_object_set_new(data, "operator", json_string(user.username));
+    if (has_device) {
+        json_object_set_new(data, "device_code", json_string(device_code_copy));
+        json_object_set_new(data, "cabinet_quantity",
+                            json_integer(new_cabinet_quantity));
+    }
     return respond_success(connection, MHD_HTTP_OK, data);
 }
 
@@ -1497,8 +1608,20 @@ static enum MHD_Result handle_sales(struct MHD_Connection *connection,
                             "note 需为字符串且不超过256字符");
     }
 
+    const char *device_code = optional_string_field(body, "device_code", 32);
+    if (device_code == NULL) {
+        json_decref(body);
+        return respond_error(connection, MHD_HTTP_BAD_REQUEST, "INVALID_INPUT",
+                            "device_code 需为字符串且不超过32字符");
+    }
+    int has_device = (device_code != NULL && *device_code != '\0');
+
     char sku_copy[65];
+    char device_code_copy[33];
     snprintf(sku_copy, sizeof(sku_copy), "%s", sku);
+    if (has_device) {
+        snprintf(device_code_copy, sizeof(device_code_copy), "%s", device_code);
+    }
 
     pthread_mutex_lock(&g_db_mutex);
 
@@ -1553,6 +1676,99 @@ static enum MHD_Result handle_sales(struct MHD_Connection *connection,
         json_decref(body);
         return respond_error(connection, MHD_HTTP_CONFLICT, "INSUFFICIENT_STOCK",
                             "库存不足，无法出库");
+    }
+
+    int device_id = 0;
+    int is_suspended = 0;
+    int cabinet_quantity = 0;
+    int new_cabinet_quantity = 0;
+
+    if (has_device) {
+        const char *find_dev_sql =
+            "SELECT d.id, d.is_suspended, COALESCE(dp.cabinet_quantity, 0) "
+            "FROM devices d "
+            "LEFT JOIN device_products dp ON dp.device_id = d.id AND dp.product_id = ? "
+            "WHERE d.code = ? LIMIT 1;";
+        if (sqlite3_prepare_v2(g_db, find_dev_sql, -1, &stmt, NULL) != SQLITE_OK) {
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                "DB_ERROR", "查询设备失败");
+        }
+        sqlite3_bind_int(stmt, 1, product_id);
+        sqlite3_bind_text(stmt, 2, device_code_copy, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND",
+                                "设备不存在");
+        }
+        device_id = sqlite3_column_int(stmt, 0);
+        is_suspended = sqlite3_column_int(stmt, 1);
+        cabinet_quantity = sqlite3_column_int(stmt, 2);
+        sqlite3_finalize(stmt);
+
+        if (is_suspended) {
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_CONFLICT,
+                                "DEVICE_SUSPENDED",
+                                "设备温度超限，暂停售卖，无法出库");
+        }
+
+        if (cabinet_quantity < quantity) {
+            rollback_transaction();
+            pthread_mutex_unlock(&g_db_mutex);
+            json_decref(body);
+            return respond_error(connection, MHD_HTTP_CONFLICT,
+                                "INSUFFICIENT_CABINET_STOCK",
+                                "柜机库存不足，无法出库");
+        }
+
+        new_cabinet_quantity = cabinet_quantity - quantity;
+
+        const char *find_dp_sql =
+            "SELECT id FROM device_products WHERE device_id = ? AND product_id = ? LIMIT 1;";
+        int dp_exists = 0;
+        int dp_id = 0;
+        if (sqlite3_prepare_v2(g_db, find_dp_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, device_id);
+            sqlite3_bind_int(stmt, 2, product_id);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                dp_exists = 1;
+                dp_id = sqlite3_column_int(stmt, 0);
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        if (dp_exists) {
+            const char *upd_dp_sql =
+                "UPDATE device_products SET cabinet_quantity = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?;";
+            if (sqlite3_prepare_v2(g_db, upd_dp_sql, -1, &stmt, NULL) != SQLITE_OK) {
+                rollback_transaction();
+                pthread_mutex_unlock(&g_db_mutex);
+                json_decref(body);
+                return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    "DB_ERROR", "更新柜机库存失败");
+            }
+            sqlite3_bind_int(stmt, 1, new_cabinet_quantity);
+            sqlite3_bind_int(stmt, 2, dp_id);
+            rc = sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            if (rc != SQLITE_DONE) {
+                rollback_transaction();
+                pthread_mutex_unlock(&g_db_mutex);
+                json_decref(body);
+                return respond_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    "DB_ERROR", "更新柜机库存失败");
+            }
+        }
     }
 
     const int new_stock = current_stock - quantity;
@@ -1620,6 +1836,11 @@ static enum MHD_Result handle_sales(struct MHD_Connection *connection,
     json_object_set_new(data, "quantity", json_integer(quantity));
     json_object_set_new(data, "new_stock", json_integer(new_stock));
     json_object_set_new(data, "operator", json_string(user.username));
+    if (has_device) {
+        json_object_set_new(data, "device_code", json_string(device_code_copy));
+        json_object_set_new(data, "cabinet_quantity",
+                            json_integer(new_cabinet_quantity));
+    }
     return respond_success(connection, MHD_HTTP_OK, data);
 }
 
@@ -2091,28 +2312,46 @@ static enum MHD_Result handle_report_temperature(struct MHD_Connection *connecti
 
     int alert_status = check_temperature_alert(device_id, temperature, min_temp, max_temp);
 
+    int is_out_of_range = (temperature > max_temp) || (temperature < min_temp);
+    int is_now_suspended = 0;
+    const char *temp_status = "NORMAL";
+    if (is_out_of_range) {
+        temp_status = (temperature > max_temp) ? "OVERHEAT" : "UNDERHEAT";
+    }
+
+    const char *recheck_sql =
+        "SELECT is_suspended FROM devices WHERE id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, recheck_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, device_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            is_now_suspended = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+
     pthread_mutex_unlock(&g_db_mutex);
     json_decref(body);
-
-    int is_out_of_range = (temperature > max_temp) || (temperature < min_temp);
-    int is_now_suspended = is_out_of_range || (alert_status == 0 && was_suspended == 1);
 
     json_t *data = json_object();
     json_object_set_new(data, "device_code", json_string(code));
     json_object_set_new(data, "temperature_c", json_real(temperature));
     json_object_set_new(data, "min_temp_c", json_real(min_temp));
     json_object_set_new(data, "max_temp_c", json_real(max_temp));
+    json_object_set_new(data, "temperature_status", json_string(temp_status));
     json_object_set_new(data, "is_out_of_range", is_out_of_range ? json_true() : json_false());
     json_object_set_new(data, "is_suspended", is_now_suspended ? json_true() : json_false());
 
     if (alert_status == 1) {
         json_object_set_new(data, "alert_triggered", json_true());
+        json_object_set_new(data, "alert_resolved", json_false());
         json_object_set_new(data, "alert_type",
                             json_string(temperature > max_temp ? "OVERHEAT" : "UNDERHEAT"));
     } else if (alert_status == -1) {
+        json_object_set_new(data, "alert_triggered", json_false());
         json_object_set_new(data, "alert_resolved", json_true());
     } else {
         json_object_set_new(data, "alert_triggered", json_false());
+        json_object_set_new(data, "alert_resolved", json_false());
     }
 
     return respond_success(connection, MHD_HTTP_OK, data);
@@ -2402,7 +2641,7 @@ static enum MHD_Result handle_device_status(struct MHD_Connection *connection) {
 
     json_t *products = json_array();
     const char *prod_sql =
-        "SELECT p.id, p.sku, p.name, p.unit, p.stock_quantity "
+        "SELECT p.id, p.sku, p.name, p.unit, p.stock_quantity, dp.cabinet_quantity "
         "FROM device_products dp "
         "JOIN products p ON p.id = dp.product_id "
         "WHERE dp.device_id = ? "
@@ -2418,11 +2657,17 @@ static enum MHD_Result handle_device_status(struct MHD_Connection *connection) {
             json_object_set_new(item, "unit", json_string(safe_col_text(stmt, 3)));
             json_object_set_new(item, "stock_quantity",
                                 json_integer(sqlite3_column_int(stmt, 4)));
+            json_object_set_new(item, "cabinet_quantity",
+                                json_integer(sqlite3_column_int(stmt, 5)));
+            int can_sell = (!is_suspended) && (sqlite3_column_int(stmt, 5) > 0);
             json_object_set_new(item, "can_sell",
-                                is_suspended ? json_false() : json_true());
+                                can_sell ? json_true() : json_false());
             if (is_suspended) {
                 json_object_set_new(item, "unsellable_reason",
                                     json_string("设备温度超限，暂停售卖"));
+            } else if (sqlite3_column_int(stmt, 5) == 0) {
+                json_object_set_new(item, "unsellable_reason",
+                                    json_string("柜机库存为0"));
             }
             json_array_append_new(products, item);
         }
@@ -2456,7 +2701,32 @@ static enum MHD_Result handle_device_status(struct MHD_Connection *connection) {
         sqlite3_finalize(stmt);
     }
 
+    int total_cabinet = 0;
+    int sellable_count = 0;
+    int unsellable_count = 0;
+    const char *summary_sql =
+        "SELECT COALESCE(SUM(dp.cabinet_quantity), 0) "
+        "FROM device_products dp WHERE dp.device_id = ?;";
+    if (sqlite3_prepare_v2(g_db, summary_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, device_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            total_cabinet = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+
     pthread_mutex_unlock(&g_db_mutex);
+
+    size_t arr_size = json_array_size(products);
+    for (size_t i = 0; i < arr_size; i++) {
+        json_t *item = json_array_get(products, i);
+        json_t *cs = json_object_get(item, "can_sell");
+        if (json_is_true(cs)) {
+            sellable_count++;
+        } else {
+            unsellable_count++;
+        }
+    }
 
     json_t *data = json_object();
     json_object_set_new(data, "id", json_integer(device_id));
@@ -2475,6 +2745,14 @@ static enum MHD_Result handle_device_status(struct MHD_Connection *connection) {
                         is_out_of_range ? json_true() : json_false());
     json_object_set_new(data, "is_suspended",
                         is_suspended ? json_true() : json_false());
+
+    json_t *summary = json_object();
+    json_object_set_new(summary, "product_count", json_integer((int)arr_size));
+    json_object_set_new(summary, "total_cabinet_quantity", json_integer(total_cabinet));
+    json_object_set_new(summary, "sellable_product_count", json_integer(sellable_count));
+    json_object_set_new(summary, "unsellable_product_count", json_integer(unsellable_count));
+    json_object_set_new(data, "summary", summary);
+
     json_object_set_new(data, "active_alert", active_alert);
     json_object_set_new(data, "products", products);
 
